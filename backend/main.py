@@ -1,4 +1,9 @@
-from fastapi import FastAPI, Response
+import sys
+import os
+sys.path.append(os.path.dirname(os.path.abspath(__file__)))
+
+from altair import Order
+from fastapi import FastAPI, Response, WebSocket
 from fastapi.middleware.cors import CORSMiddleware
 import xgboost as xgb
 import pandas as pd
@@ -9,6 +14,7 @@ import inventory_logic  # Import your logic file
 from fastapi.responses import JSONResponse
 import json
 from dotenv import load_dotenv
+from pydantic import BaseModel
 
 # Load environment variables
 load_dotenv()
@@ -69,9 +75,9 @@ def debug_db():
         return {"error": str(e)}
 
 @app.get("/dashboard-data")
-def get_dashboard_data(product_name: str = "OVERALL"):
+def get_dashboard_data(product: str = "OVERALL"):
     # CASE 1: "OVERALL" (Sum of all products)
-    if product_name == "OVERALL":
+    if product == "OVERALL":
         all_products = db.sales.distinct("product")
         total_prediction = 0
         total_stock = 0
@@ -120,10 +126,10 @@ def get_dashboard_data(product_name: str = "OVERALL"):
         }
 
 
-    latest_record = db.sales.find_one({"product": product_name}, sort=[("date", -1)])
+    latest_record = db.sales.find_one({"product": product}, sort=[("date", -1)])
     if not latest_record:
         return {
-            "product": product_name,
+            "product": product,
             "error": "Product not found",
             "inventory_health": {
                 "risk_status": "UNKNOWN",
@@ -137,7 +143,7 @@ def get_dashboard_data(product_name: str = "OVERALL"):
     lead_time = int(latest_record.get("lead_time_days", 3))
 
     last_7_days = list(db.sales.find(
-        {"product": product_name},
+        {"product": product},
         {"sales": 1, "promotion": 1, "_id": 0}
     ).sort("date", -1).limit(7))
     
@@ -147,7 +153,7 @@ def get_dashboard_data(product_name: str = "OVERALL"):
     promo_val = 1 if any(x.get("promotion") == "True" or x.get("promotion") is True for x in last_7_days) else 0
 
     product_mapping = {"Casual Sneakers": 0, "Formal Shoes": 1, "Running Shoes": 2}
-    p_code = product_mapping.get(product_name, 0)
+    p_code = product_mapping.get(product, 0)
 
     future_date = datetime.now() + timedelta(days=1)
     input_data = pd.DataFrame([{
@@ -191,7 +197,7 @@ def get_dashboard_data(product_name: str = "OVERALL"):
     )
 
     return {
-        "product": product_name,
+        "product": product,
         "ai_prediction_tomorrow": predicted_sales,
         "forecast_next_7_days": [int(predicted_sales * (1 + i*0.02)) for i in range(7)],
         "inventory_health": risk_report,
@@ -208,3 +214,75 @@ def favicon():
 @app.get("/.well-known/appspecific/com.chrome.devtools.json")
 def handle_unknown():
     return JSONResponse(content={"error": "Not Found"}, status_code=404)
+
+from pydantic import BaseModel
+
+class Order(BaseModel):
+    product: str
+    quantity: int
+
+@app.post("/simulate-sale")
+def simulate_sale(order: Order):
+    # 1. Find the product
+    latest = db.sales.find_one({"product": order.product}, sort=[("date", -1)])
+
+    if latest:
+        new_stock = max(0, int(latest["stock_level"]) - order.quantity)
+
+        # 2. JUST UPDATE THE STOCK (Don't worry about re-training AI)
+        result = db.sales.update_one(
+            {"_id": latest["_id"]},
+            {"$set": {"stock_level": new_stock}}
+        )
+        notify_clients(f"Product {order.product} stock updated to {new_stock}")
+        print(f"Update Result: {result.modified_count} document(s) updated.")
+        return {"message": f"Stock updated to {new_stock}"}
+
+    return {"error": "Product not found"}
+
+class StockUp(BaseModel):
+    product: str
+    quantity: int
+
+@app.post("/stimulate-stock-up")
+def stimulate_stock_up(stock: StockUp):
+    # Find the latest record for the product
+    latest = db.sales.find_one({"product": stock.product}, sort=[("date", -1)])
+
+    if latest:
+        # Update the stock level by adding the received quantity
+        new_stock = int(latest["stock_level"]) + stock.quantity
+
+        result = db.sales.update_one(
+            {"_id": latest["_id"]},
+            {"$set": {"stock_level": new_stock}}
+        )
+        notify_clients(f"Product {stock.product} stock updated to {new_stock}")
+        print(f"Update Result: {result.modified_count} document(s) updated.")
+        return {"message": f"Stock updated to {new_stock}"}
+
+    return {"error": "Product not found"}
+
+# List to store connected WebSocket clients
+connected_clients = []
+
+@app.websocket("/ws")
+async def websocket_endpoint(websocket: WebSocket):
+    await websocket.accept()
+    connected_clients.append(websocket)
+    try:
+        while True:
+            # Keep the connection alive
+            await websocket.receive_text()
+    except Exception as e:
+        print(f"WebSocket disconnected: {e}")
+    finally:
+        connected_clients.remove(websocket)
+
+# Function to notify clients about database changes
+def notify_clients(message: str):
+    for client in connected_clients:
+        try:
+            asyncio.create_task(client.send_text(message))
+        except Exception as e:
+            print(f"Failed to send message to client: {e}")

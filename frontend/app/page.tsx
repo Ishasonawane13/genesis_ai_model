@@ -26,8 +26,9 @@ export default function Dashboard() {
   // 2. Fetch Dashboard Data (Runs whenever 'selectedProduct' changes)
   useEffect(() => {
     setLoading(true);
-    axios.get(`http://127.0.0.1:8000/dashboard-data?product_name=${selectedProduct}`)
+    axios.get(`http://127.0.0.1:8000/dashboard-data?product=${selectedProduct}`)
       .then((response) => {
+        console.log("Dashboard Data:", response.data);
         setData(response.data);
         setLoading(false);
       })
