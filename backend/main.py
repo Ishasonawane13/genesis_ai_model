@@ -69,98 +69,142 @@ def debug_db():
         return {"error": str(e)}
 
 @app.get("/dashboard-data")
-def get_dashboard_data(product: str = "Running Shoes"):
-    """
-    Returns AI forecast & Risk Analysis for a specific product.
-    """
-    
-    # A. Get Current Product Status (Stock, Lead Time)
-    product_clean = product.strip()
-    product_info = db.sales.find_one(
-        {"product": {"$regex": f"^{product_clean}$", "$options": "i"}}, 
-        sort=[("date", -1)]
-    )
-    
-    if not product_info:
-        available_products = db.sales.distinct("product")
-        return {
-            "error": f"Product '{product}' not found",
-            "available_products": available_products,
-            "checked_database": db.name,
-            "checked_collection": "sales"
-        }
-        
-    try:
-        current_stock = int(product_info.get("stock_level", 0))
-        lead_time = int(product_info.get("lead_time_days", 3))
-    except (ValueError, TypeError):
-        current_stock = 0
-        lead_time = 3
+def get_dashboard_data(product_name: str = "OVERALL"):
+    # CASE 1: "OVERALL" (Sum of all products)
+    if product_name == "OVERALL":
+        all_products = db.sales.distinct("product")
+        total_prediction = 0
+        total_stock = 0
 
-    # B. Prepare Input for AI (The "Context")
-    # Fetch real historical data for better prediction
+        for p in all_products:
+            latest = db.sales.find_one({"product": p}, sort=[("date", -1)])
+            if latest:
+                total_stock += int(latest.get("stock_level", 0))
+
+                # Fetch dynamic features for this product
+                last_7 = list(db.sales.find({"product": p}, {"sales": 1}).sort("date", -1).limit(7))
+                history = [int(x.get("sales", 0)) for x in last_7]
+                p_lag = history[-1] if len(history) >= 7 else 15
+                p_mean = sum(history) / len(history) if history else 18
+
+                product_mapping = {"Casual Sneakers": 0, "Formal Shoes": 1, "Running Shoes": 2}
+                p_code = product_mapping.get(p, 0)
+
+                input_data = pd.DataFrame([{
+                    "day_of_week": (datetime.now() + timedelta(days=1)).weekday(),
+                    "month": datetime.now().month,
+                    "is_weekend": 1 if (datetime.now() + timedelta(days=1)).weekday() >= 5 else 0,
+                    "promotion": 0, 
+                    "product_code": p_code, 
+                    "lag_7": p_lag, 
+                    "rolling_mean_7": p_mean 
+                }])
+                try:
+                    cols = ['day_of_week', 'month', 'is_weekend', 'promotion', 'lag_7', 'rolling_mean_7', 'product_code']
+                    input_data = input_data[cols]
+                    pred = model.predict(input_data)[0]
+                    total_prediction += max(0, int(pred))
+                except Exception as e:
+                    print(f"Prediction failed for {p}: {e}")
+
+        return {
+            "product": "All Products (Combined)",
+            "ai_prediction_tomorrow": total_prediction,
+            "forecast_next_7_days": [int(total_prediction * (1 + i*0.01)) for i in range(7)],
+            "inventory_health": {
+                "risk_status": "LOW",
+                "days_until_stockout": 99,
+                "suggested_order_qty": 0,
+                "current_stock": total_stock
+            }
+        }
+
+
+    latest_record = db.sales.find_one({"product": product_name}, sort=[("date", -1)])
+    if not latest_record:
+        return {
+            "product": product_name,
+            "error": "Product not found",
+            "inventory_health": {
+                "risk_status": "UNKNOWN",
+                "days_until_stockout": 0,
+                "suggested_order_qty": 0,
+                "current_stock": 0
+            }
+        }
+
+    current_stock = int(latest_record.get("stock_level", 0))  
+    lead_time = int(latest_record.get("lead_time_days", 3))
+
     last_7_days = list(db.sales.find(
-        {"product": product_info["product"]},
-        {"sales": 1, "_id": 0}
+        {"product": product_name},
+        {"sales": 1, "promotion": 1, "_id": 0}
     ).sort("date", -1).limit(7))
     
-    sales_history = [pd.to_numeric(x.get("sales", 0)) for x in last_7_days]
+    sales_history = [int(x.get("sales", 0)) for x in last_7_days]
     lag_val = sales_history[-1] if len(sales_history) >= 7 else 15
     mean_val = sum(sales_history) / len(sales_history) if sales_history else 18
+    promo_val = 1 if any(x.get("promotion") == "True" or x.get("promotion") is True for x in last_7_days) else 0
 
     product_mapping = {"Casual Sneakers": 0, "Formal Shoes": 1, "Running Shoes": 2}
-    p_code = product_mapping.get(product_info["product"], 2)
+    p_code = product_mapping.get(product_name, 0)
 
     future_date = datetime.now() + timedelta(days=1)
-    
-    # Create the data for prediction
-    ai_features = pd.DataFrame([{
+    input_data = pd.DataFrame([{
         "day_of_week": future_date.weekday(),
         "month": future_date.month,
         "is_weekend": 1 if future_date.weekday() >= 5 else 0,
-        "promotion": 0,
-        "lag_7": lag_val,
-        "rolling_mean_7": mean_val,
-        "product_code": p_code
+        "promotion": promo_val, 
+        "product_code": p_code, 
+        "lag_7": lag_val, 
+        "rolling_mean_7": mean_val 
     }])
-    
-    # Ensure feature order matches training exactly
-    cols = ['day_of_week', 'month', 'is_weekend', 'promotion', 'lag_7', 'rolling_mean_7', 'product_code']
-    ai_features = ai_features[cols]
-    
-    # C. Run AI Prediction
-    try:
-        prediction = model.predict(ai_features)[0]
-        predicted_sales = max(0, int(prediction))
-        print(f"🎯 AI Prediction for {product}: {predicted_sales}")
-    except Exception as e:
-        print(f"⚠️ AI Prediction failed: {e}")
-        predicted_sales = 21 # Fallback dummy value
 
-    # D. Calculate Inventory Risk (Using your logic file)
-    weekly_demand_forecast = predicted_sales * 7
+
+    cols = ['day_of_week', 'month', 'is_weekend', 'promotion', 'lag_7', 'rolling_mean_7', 'product_code']
+    input_data = input_data[cols]
+
+    try:
+        predicted_sales = max(0, int(model.predict(input_data)[0]))
+    except Exception as e:
+        print(f"Prediction failed: {e}")
+        predicted_sales = int(mean_val) 
+
+
+    reasons = []
+    if input_data['is_weekend'].iloc[0] == 1:
+        reasons.append("Weekend demand surge expected")
+    if input_data['promotion'].iloc[0] == 1:
+        reasons.append("Active promotion is boosting sales")
+    if input_data['lag_7'].iloc[0] > mean_val:
+        reasons.append("Sales trend is higher than last week")
+    if input_data['month'].iloc[0] in [10, 11, 12]:
+        reasons.append("High seasonal demand (Q4 Festive Season)")
+    
+    if not reasons:
+        reasons.append("Based on historical daily sales patterns")
+
     risk_report = inventory_logic.calculate_inventory_risk(
         current_stock=current_stock,
-        predicted_sales_next_7_days=weekly_demand_forecast,
+        predicted_sales_next_7_days=predicted_sales * 7,
         lead_time_days=lead_time
     )
 
-    # E. Return JSON to Frontend
-    response = {
-        "product": product,
+    return {
+        "product": product_name,
         "ai_prediction_tomorrow": predicted_sales,
         "forecast_next_7_days": [int(predicted_sales * (1 + i*0.02)) for i in range(7)],
-        "inventory_health": risk_report
+        "inventory_health": risk_report,
+        "ai_reasoning": reasons
     }
 
-    return JSONResponse(content=response)
 
-# Handle favicon.ico requests
+
 @app.get("/favicon.ico")
 def favicon():
     return Response(status_code=204)
 
-# Handle unknown routes
+
 @app.get("/.well-known/appspecific/com.chrome.devtools.json")
 def handle_unknown():
     return JSONResponse(content={"error": "Not Found"}, status_code=404)

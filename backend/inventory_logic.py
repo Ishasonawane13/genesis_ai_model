@@ -8,6 +8,9 @@ def calculate_inventory_risk(current_stock, predicted_sales_next_7_days, lead_ti
     Reorder Point (ROP) = (Avg Daily Demand * Lead Time) + Safety Stock
     """
     
+    # Ensure lead_time_days is a float
+    lead_time_days = float(lead_time_days)
+    
     # 1. Calculate Average Daily Demand based on AI prediction
     avg_daily_demand = predicted_sales_next_7_days / 7
     
